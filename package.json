@@ -1,7 +1,7 @@
 {
-  "name": "foxsignals-webhook-listener",
-  "version": "1.0.0",
-  "description": "Webhook listener for FoxSignals trading signals - forwards Entry, TP, and SL signals to your bot",
+  "name": "foxsignals-listener",
+  "version": "2.0.0",
+  "description": "Real-time FoxSignals listener via Firebase - forwards signals to your bot",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -10,7 +10,7 @@
   "keywords": [
     "foxsignals",
     "trading",
-    "webhook",
+    "firebase",
     "signals",
     "crypto"
   ],
@@ -19,9 +19,13 @@
   "dependencies": {
     "axios": "^1.6.2",
     "dotenv": "^16.3.1",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "firebase": "^10.7.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

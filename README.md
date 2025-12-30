@@ -1,152 +1,143 @@
-# FoxSignals Webhook Listener
+# FoxSignals Realtime Listener
 
-Ein Webhook-Listener, der Trading-Signale von FoxSignals empfängt und an deinen Bot weiterleitet.
+Hört in Echtzeit auf FoxSignals via Firebase und leitet die Signale an deinen Bot weiter.
 
 ## Features
 
-- Empfängt Signale von FoxSignals
-- Parst Entry, Take Profits (TP1-TP5) und Stop Loss
-- Leitet Signale an deine Webhook-URL weiter
-- Unterstützt JSON und Text-Formate
-- Automatische Wiederholungsversuche bei Fehlern
+- **Realtime Listening** - Direkte Firebase/Firestore Verbindung
+- **Alle Signale** - Entry, TP1-TP5, Stop Loss
+- **Multiple Collections** - signalsAggrOpen, signalsCrypto, signalsForex, signalsStocks
+- **Auto-Forward** - Automatische Weiterleitung an deine Webhook-URL
+- **Railway Ready** - Optimiert für Railway Deployment
 
-## Installation
+## Railway Deployment
+
+### 1. Repository deployen
+
+1. Gehe zu [Railway](https://railway.app)
+2. "New Project" → "Deploy from GitHub repo"
+3. Wähle dieses Repository
+
+### 2. Environment Variables setzen
+
+In Railway → Variables:
+
+```
+FOXSIGNALS_EMAIL=deine-foxsignals@email.com
+FOXSIGNALS_PASSWORD=dein-passwort
+BOT_WEBHOOK_URL=https://dein-bot.com/webhook
+```
+
+### 3. Deploy!
+
+Railway baut und startet automatisch.
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `FOXSIGNALS_EMAIL` | ✅ | Dein FoxSignals Email |
+| `FOXSIGNALS_PASSWORD` | ✅ | Dein FoxSignals Passwort |
+| `BOT_WEBHOOK_URL` | ✅ | Webhook URL deines Bots |
+| `WEBHOOK_SECRET` | ❌ | Secret für Bot-Auth |
+| `PORT` | ❌ | Port (default: 3000) |
+
+## Was an deinen Bot gesendet wird
+
+```json
+{
+  "id": "signal-doc-id",
+  "source": "foxsignals",
+  "collection": "signalsAggrOpen",
+  "type": "new",
+  "timestamp": "2024-01-15T12:00:00.000Z",
+
+  "symbol": "BTCUSDT",
+  "direction": "long",
+  "action": "LONG",
+
+  "entry": 50000,
+  "entryPrice": 50000,
+  "stopLoss": 49000,
+  "sl": 49000,
+
+  "takeProfit": [51000, 52000, 53000, 54000, 55000],
+  "tp1": 51000,
+  "tp2": 52000,
+  "tp3": 53000,
+  "tp4": 54000,
+  "tp5": 55000,
+
+  "isFree": true,
+  "isPremium": false,
+  "leverage": 10
+}
+```
+
+## Signal Types
+
+- `new` - Neues Signal
+- `update` - Signal wurde aktualisiert
+- `closed` - Signal wurde geschlossen/entfernt
+
+## Logs in Railway
+
+Die Logs zeigen alle eingehenden Signale:
+
+```
+╔══════════════════════════════════════════════════╗
+║ 🦊 FOXSIGNAL NEW                                  ║
+╠══════════════════════════════════════════════════╣
+║ Symbol:    BTCUSDT                               ║
+║ Direction: long                                   ║
+║ Entry:     50000                                 ║
+║ Stop Loss: 49000                                 ║
+╟──────────────────────────────────────────────────╢
+║ TP1:       51000                                 ║
+║ TP2:       52000                                 ║
+║ TP3:       53000                                 ║
+╟──────────────────────────────────────────────────╢
+║ Free: YES  |  Premium: NO                        ║
+║ Time: 2024-01-15T12:00:00.000Z                   ║
+╚══════════════════════════════════════════════════╝
+```
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Service Info |
+| `/health` | GET | Health Check + Stats |
+| `/stats` | GET | Detaillierte Statistiken |
+| `/test` | POST | Test-Signal an Bot senden |
+
+## Local Development
 
 ```bash
 # Dependencies installieren
 npm install
 
-# .env Datei erstellen
+# .env erstellen
 cp .env.example .env
 
-# .env bearbeiten und BOT_WEBHOOK_URL setzen
-```
+# .env bearbeiten mit deinen Credentials
 
-## Konfiguration
-
-Bearbeite die `.env` Datei:
-
-```env
-# Dein Bot's Webhook URL (PFLICHT)
-BOT_WEBHOOK_URL=https://dein-bot.com/webhook
-
-# Optional: Secret für Authentifizierung
-WEBHOOK_SECRET=dein-secret
-```
-
-## Starten
-
-```bash
-# Production
-npm start
-
-# Development (mit Auto-Reload)
+# Starten
 npm run dev
 ```
 
-## Webhook Endpoints
+## Troubleshooting
 
-### POST `/webhook/foxsignals`
-Hauptendpoint für FoxSignals.
+### "Login failed"
+- Überprüfe Email/Passwort
+- Stelle sicher, dass du einen aktiven FoxSignals Account hast
 
-**JSON Format:**
-```json
-{
-  "symbol": "BTCUSDT",
-  "action": "LONG",
-  "entry": 50000,
-  "tp1": 51000,
-  "tp2": 52000,
-  "tp3": 53000,
-  "stopLoss": 49000,
-  "leverage": 10
-}
-```
+### "Signal not forwarded"
+- Überprüfe BOT_WEBHOOK_URL
+- Stelle sicher, dass dein Bot erreichbar ist
 
-### POST `/webhook/foxsignals/text`
-Für Text-basierte Signale (Telegram-Style).
-
-**Text Format:**
-```
-#BTCUSDT LONG
-
-Entry: 50000 - 50500
-TP1: 51000
-TP2: 52000
-TP3: 53000
-SL: 49000
-
-Leverage: 10x
-```
-
-## Ausgabe an deinen Bot
-
-Der Listener sendet folgendes Format an deine Webhook-URL:
-
-```json
-{
-  "source": "foxsignals",
-  "timestamp": "2024-01-15T12:00:00.000Z",
-  "symbol": "BTCUSDT",
-  "action": "LONG",
-  "side": "buy",
-  "entry": 50000,
-  "entryPrice": 50000,
-  "takeProfit": [51000, 52000, 53000],
-  "tp1": 51000,
-  "tp2": 52000,
-  "tp3": 53000,
-  "stopLoss": 49000,
-  "sl": 49000,
-  "leverage": 10
-}
-```
-
-## Deployment
-
-### Mit ngrok (zum Testen)
-```bash
-npm start
-ngrok http 3000
-# Nutze die ngrok URL als Webhook bei FoxSignals
-```
-
-### Mit PM2
-```bash
-npm install -g pm2
-pm2 start src/index.js --name foxsignals
-pm2 save
-```
-
-### Docker
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install --production
-COPY . .
-EXPOSE 3000
-CMD ["npm", "start"]
-```
-
-## Testen
-
-```bash
-# Health Check
-curl http://localhost:3000/health
-
-# Test Signal senden
-curl -X POST http://localhost:3000/webhook/foxsignals \
-  -H "Content-Type: application/json" \
-  -d '{
-    "symbol": "BTCUSDT",
-    "action": "LONG",
-    "entry": 50000,
-    "tp1": 51000,
-    "tp2": 52000,
-    "stopLoss": 49000
-  }'
-```
+### "Permission denied"
+- Dein FoxSignals Account benötigt ggf. ein Premium Abo für alle Signale
 
 ## Lizenz
 

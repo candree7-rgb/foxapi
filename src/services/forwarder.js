@@ -4,9 +4,8 @@
  */
 
 const axios = require('axios');
+const { log, logForwardResult } = require('../utils/logger');
 
-const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const RETRY_ATTEMPTS = parseInt(process.env.RETRY_ATTEMPTS || '3');
 const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || '1000');
 
@@ -16,37 +15,37 @@ const RETRY_DELAY = parseInt(process.env.RETRY_DELAY || '1000');
  * @returns {Object} Result with success status
  */
 async function forwardSignal(signal) {
-  if (!BOT_WEBHOOK_URL) {
-    console.error('[Forwarder] BOT_WEBHOOK_URL not configured!');
+  const webhookUrl = process.env.BOT_WEBHOOK_URL;
+  const webhookSecret = process.env.WEBHOOK_SECRET;
+
+  if (!webhookUrl) {
+    log('FORWARD', '⚠️ BOT_WEBHOOK_URL not configured - signal not forwarded');
     return { success: false, error: 'Webhook URL not configured' };
   }
 
-  // Format the signal for the bot
-  const payload = formatPayload(signal);
-
-  console.log('[Forwarder] Forwarding to:', BOT_WEBHOOK_URL);
-  console.log('[Forwarder] Payload:', JSON.stringify(payload, null, 2));
+  log('FORWARD', `📤 Forwarding signal to: ${webhookUrl}`);
+  log('FORWARD', `   Symbol: ${signal.symbol} | Action: ${signal.action}`);
 
   // Try to send with retries
   for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
     try {
       const headers = {
         'Content-Type': 'application/json',
-        'User-Agent': 'FoxSignals-Webhook-Listener/1.0'
+        'User-Agent': 'FoxSignals-Listener/2.0'
       };
 
       // Add secret if configured
-      if (WEBHOOK_SECRET) {
-        headers['X-Webhook-Secret'] = WEBHOOK_SECRET;
-        headers['Authorization'] = `Bearer ${WEBHOOK_SECRET}`;
+      if (webhookSecret) {
+        headers['X-Webhook-Secret'] = webhookSecret;
+        headers['Authorization'] = `Bearer ${webhookSecret}`;
       }
 
-      const response = await axios.post(BOT_WEBHOOK_URL, payload, {
+      const response = await axios.post(webhookUrl, signal, {
         headers,
         timeout: 10000
       });
 
-      console.log(`[Forwarder] Success (attempt ${attempt}):`, response.status);
+      logForwardResult(true, webhookUrl, response.status);
 
       return {
         success: true,
@@ -55,12 +54,13 @@ async function forwardSignal(signal) {
       };
 
     } catch (error) {
-      console.error(`[Forwarder] Attempt ${attempt} failed:`, error.message);
+      log('FORWARD', `❌ Attempt ${attempt}/${RETRY_ATTEMPTS} failed: ${error.message}`);
 
       if (attempt < RETRY_ATTEMPTS) {
-        console.log(`[Forwarder] Retrying in ${RETRY_DELAY}ms...`);
+        log('FORWARD', `   Retrying in ${RETRY_DELAY}ms...`);
         await sleep(RETRY_DELAY);
       } else {
+        logForwardResult(false, webhookUrl, error.response?.status);
         return {
           success: false,
           error: error.message,
@@ -71,54 +71,6 @@ async function forwardSignal(signal) {
   }
 
   return { success: false, error: 'Max retries exceeded' };
-}
-
-/**
- * Format the signal payload for the bot
- * @param {Object} signal - Parsed signal
- * @returns {Object} Formatted payload
- */
-function formatPayload(signal) {
-  // Standard format that most bots can understand
-  const payload = {
-    // Metadata
-    source: 'foxsignals',
-    timestamp: signal.timestamp,
-
-    // Core signal data
-    symbol: signal.symbol,
-    action: signal.action,
-    side: signal.action === 'LONG' ? 'buy' : signal.action === 'SHORT' ? 'sell' : signal.action.toLowerCase(),
-
-    // Prices
-    entry: signal.entry,
-    entryPrice: typeof signal.entry === 'object' ? signal.entry.min : signal.entry,
-
-    // Take profits
-    takeProfit: signal.takeProfit,
-    tp1: signal.takeProfit[0] || null,
-    tp2: signal.takeProfit[1] || null,
-    tp3: signal.takeProfit[2] || null,
-    tp4: signal.takeProfit[3] || null,
-    tp5: signal.takeProfit[4] || null,
-
-    // Stop loss
-    stopLoss: signal.stopLoss,
-    sl: signal.stopLoss,
-
-    // Optional
-    leverage: signal.leverage,
-    risk: signal.risk,
-    notes: signal.notes,
-
-    // Raw data for debugging
-    raw: signal.raw
-  };
-
-  // Clean up null values if desired
-  // Object.keys(payload).forEach(key => payload[key] === null && delete payload[key]);
-
-  return payload;
 }
 
 /**
@@ -135,22 +87,34 @@ function sleep(ms) {
  */
 async function testWebhook() {
   const testSignal = {
-    timestamp: new Date().toISOString(),
+    id: 'test-signal',
     source: 'foxsignals',
+    collection: 'test',
+    type: 'test',
+    timestamp: new Date().toISOString(),
     symbol: 'BTCUSDT',
+    direction: 'long',
     action: 'LONG',
     entry: 50000,
-    takeProfit: [51000, 52000, 53000],
+    entryPrice: 50000,
     stopLoss: 49000,
-    notes: 'Test signal - please ignore'
+    sl: 49000,
+    takeProfit: [51000, 52000, 53000],
+    tp1: 51000,
+    tp2: 52000,
+    tp3: 53000,
+    tp4: null,
+    tp5: null,
+    isFree: true,
+    isPremium: false,
+    leverage: null
   };
 
-  console.log('[Forwarder] Sending test signal...');
+  log('FORWARD', '🧪 Sending test signal...');
   return forwardSignal(testSignal);
 }
 
 module.exports = {
   forwardSignal,
-  formatPayload,
   testWebhook
 };

@@ -1,94 +1,167 @@
 require('dotenv').config();
 const express = require('express');
-const webhookHandler = require('./handlers/webhook');
-const { forwardSignal } = require('./services/forwarder');
-const { parseSignal } = require('./utils/signalParser');
+const { login, startAllListeners, monitorAuthState } = require('./services/firebase');
+const { forwardSignal, testWebhook } = require('./services/forwarder');
+const { log, logSignalBox, logStartupBanner } = require('./utils/logger');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// Logging middleware
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  next();
-});
+// Stats tracking
+let stats = {
+  startTime: new Date(),
+  signalsReceived: 0,
+  signalsForwarded: 0,
+  signalsFailed: 0,
+  lastSignal: null
+};
 
-// Health check endpoint
+/**
+ * Handle incoming signal from Firebase
+ * @param {Object} signal - Parsed signal from Firestore
+ */
+async function handleSignal(signal) {
+  stats.signalsReceived++;
+  stats.lastSignal = signal;
+
+  // Log the signal in a nice format
+  logSignalBox(signal);
+
+  // Forward to user's bot
+  const result = await forwardSignal(signal);
+
+  if (result.success) {
+    stats.signalsForwarded++;
+  } else {
+    stats.signalsFailed++;
+  }
+}
+
+// Health check endpoint (Railway needs this)
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  const uptime = Math.floor((Date.now() - stats.startTime.getTime()) / 1000);
+  res.json({
+    status: 'ok',
+    uptime: `${uptime}s`,
+    signals: {
+      received: stats.signalsReceived,
+      forwarded: stats.signalsForwarded,
+      failed: stats.signalsFailed
+    },
+    lastSignal: stats.lastSignal ? {
+      symbol: stats.lastSignal.symbol,
+      action: stats.lastSignal.action,
+      time: stats.lastSignal.timestamp
+    } : null
+  });
 });
 
-// Main FoxSignals webhook endpoint
-app.post('/webhook/foxsignals', async (req, res) => {
-  try {
-    console.log('[FoxSignals] Incoming webhook:', JSON.stringify(req.body, null, 2));
-
-    // Parse the signal
-    const signal = parseSignal(req.body);
-
-    if (!signal) {
-      console.log('[FoxSignals] Could not parse signal');
-      return res.status(400).json({ error: 'Invalid signal format' });
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    name: 'FoxSignals Listener',
+    version: '2.0.0',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      stats: '/stats',
+      test: '/test'
     }
+  });
+});
 
-    console.log('[FoxSignals] Parsed signal:', JSON.stringify(signal, null, 2));
+// Stats endpoint
+app.get('/stats', (req, res) => {
+  const uptime = Math.floor((Date.now() - stats.startTime.getTime()) / 1000);
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  const seconds = uptime % 60;
 
-    // Forward to user's bot
-    const forwardResult = await forwardSignal(signal);
+  res.json({
+    uptime: `${hours}h ${minutes}m ${seconds}s`,
+    startTime: stats.startTime.toISOString(),
+    signals: {
+      total: stats.signalsReceived,
+      forwarded: stats.signalsForwarded,
+      failed: stats.signalsFailed,
+      successRate: stats.signalsReceived > 0
+        ? `${((stats.signalsForwarded / stats.signalsReceived) * 100).toFixed(1)}%`
+        : 'N/A'
+    },
+    lastSignal: stats.lastSignal
+  });
+});
 
-    if (forwardResult.success) {
-      console.log('[FoxSignals] Signal forwarded successfully');
-      res.json({ success: true, signal, forwarded: true });
-    } else {
-      console.error('[FoxSignals] Forward failed:', forwardResult.error);
-      res.status(500).json({ success: false, error: 'Failed to forward signal' });
-    }
-  } catch (error) {
-    console.error('[FoxSignals] Error processing webhook:', error.message);
-    res.status(500).json({ error: error.message });
+// Test webhook endpoint
+app.post('/test', async (req, res) => {
+  log('API', '🧪 Test webhook requested');
+  const result = await testWebhook();
+  res.json(result);
+});
+
+/**
+ * Main startup function
+ */
+async function main() {
+  // Show startup banner
+  logStartupBanner({
+    port: PORT,
+    webhookUrl: process.env.BOT_WEBHOOK_URL
+  });
+
+  // Check required environment variables
+  const email = process.env.FOXSIGNALS_EMAIL;
+  const password = process.env.FOXSIGNALS_PASSWORD;
+
+  if (!email || !password) {
+    log('ERROR', '❌ FOXSIGNALS_EMAIL and FOXSIGNALS_PASSWORD are required!');
+    log('ERROR', '   Set these environment variables in Railway');
+    process.exit(1);
   }
-});
 
-// Alternative endpoint for raw text signals (TradingView style)
-app.post('/webhook/foxsignals/text', async (req, res) => {
-  try {
-    const rawText = typeof req.body === 'string' ? req.body : req.body.message || req.body.text || '';
-    console.log('[FoxSignals] Raw text signal:', rawText);
-
-    const signal = parseSignal({ text: rawText });
-
-    if (!signal) {
-      return res.status(400).json({ error: 'Could not parse text signal' });
-    }
-
-    const forwardResult = await forwardSignal(signal);
-    res.json({ success: forwardResult.success, signal });
-  } catch (error) {
-    console.error('[FoxSignals] Text webhook error:', error.message);
-    res.status(500).json({ error: error.message });
+  if (!process.env.BOT_WEBHOOK_URL) {
+    log('WARN', '⚠️ BOT_WEBHOOK_URL not set - signals will be logged but not forwarded');
   }
+
+  try {
+    // Login to Firebase with FoxSignals credentials
+    await login(email, password);
+
+    // Monitor auth state
+    monitorAuthState();
+
+    // Start listening to all signal collections
+    startAllListeners(handleSignal);
+
+    // Start HTTP server
+    app.listen(PORT, () => {
+      log('SERVER', `✅ HTTP server running on port ${PORT}`);
+      log('SERVER', '='.repeat(50));
+      log('SERVER', '🦊 FoxSignals Listener is now active!');
+      log('SERVER', '   Waiting for signals...');
+      log('SERVER', '='.repeat(50));
+    });
+
+  } catch (error) {
+    log('ERROR', `❌ Startup failed: ${error.message}`);
+    console.error(error);
+    process.exit(1);
+  }
+}
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+  log('SERVER', '⏹️ Received SIGTERM, shutting down...');
+  process.exit(0);
 });
 
-// Catch-all for debugging
-app.all('*', (req, res) => {
-  console.log('[Debug] Unhandled request:', req.method, req.path);
-  console.log('[Debug] Body:', req.body);
-  res.status(404).json({ error: 'Endpoint not found' });
+process.on('SIGINT', () => {
+  log('SERVER', '⏹️ Received SIGINT, shutting down...');
+  process.exit(0);
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log('='.repeat(50));
-  console.log('FoxSignals Webhook Listener');
-  console.log('='.repeat(50));
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Webhook URL: http://localhost:${PORT}/webhook/foxsignals`);
-  console.log(`Forward URL: ${process.env.BOT_WEBHOOK_URL || 'NOT SET'}`);
-  console.log('='.repeat(50));
-});
-
-module.exports = app;
+// Start the application
+main();
