@@ -6,7 +6,7 @@
 
 const { initializeApp } = require('firebase/app');
 const { getFirestore, collection, onSnapshot } = require('firebase/firestore');
-const { getAuth, signInWithEmailAndPassword, signInWithCredential, GoogleAuthProvider, onAuthStateChanged } = require('firebase/auth');
+const { getAuth, signInWithEmailAndPassword, onAuthStateChanged } = require('firebase/auth');
 const axios = require('axios');
 const { log } = require('../utils/logger');
 
@@ -35,12 +35,10 @@ const seenSignals = new Set();
 // Store for polling
 let pollingInterval = null;
 let currentIdToken = null;
+let currentRefreshToken = null;
 
 /**
  * Login with email and password
- * @param {string} email - FoxSignals email
- * @param {string} password - FoxSignals password
- * @returns {Promise<Object>} User credential
  */
 async function loginWithEmail(email, password) {
   log('AUTH', 'Logging in with Email/Password...');
@@ -50,9 +48,7 @@ async function loginWithEmail(email, password) {
     log('AUTH', `✅ Logged in as: ${userCredential.user.email}`);
     log('AUTH', `   UID: ${userCredential.user.uid}`);
 
-    // Get ID Token for REST API fallback
     currentIdToken = await userCredential.user.getIdToken();
-
     return userCredential;
   } catch (error) {
     log('AUTH', `❌ Login failed: ${error.code} - ${error.message}`);
@@ -62,7 +58,6 @@ async function loginWithEmail(email, password) {
 
 /**
  * Use JWT/ID Token directly (for Google OAuth users)
- * @param {string} idToken - Firebase ID Token
  */
 function useIdToken(idToken) {
   log('AUTH', 'Using provided ID Token for authentication');
@@ -71,35 +66,54 @@ function useIdToken(idToken) {
 }
 
 /**
- * Refresh token using Firebase REST API
- * @param {string} refreshToken - Refresh token
- * @returns {Promise<string>} New ID token
+ * Set refresh token for auto-refresh
  */
-async function refreshIdToken(refreshToken) {
+function setRefreshToken(refreshToken) {
+  currentRefreshToken = refreshToken;
+  log('AUTH', '✅ Refresh token stored');
+}
+
+/**
+ * Refresh token using Firebase REST API
+ */
+async function refreshIdToken(refreshToken = null) {
+  const tokenToUse = refreshToken || currentRefreshToken;
+
+  if (!tokenToUse) {
+    throw new Error('No refresh token available');
+  }
+
+  log('AUTH', '🔄 Refreshing token...');
+
   try {
     const response = await axios.post(
       `https://securetoken.googleapis.com/v1/token?key=${firebaseConfig.apiKey}`,
       {
         grant_type: 'refresh_token',
-        refresh_token: refreshToken
+        refresh_token: tokenToUse
       }
     );
 
     currentIdToken = response.data.id_token;
-    log('AUTH', '✅ Token refreshed');
+    // Update refresh token if a new one was issued
+    if (response.data.refresh_token) {
+      currentRefreshToken = response.data.refresh_token;
+    }
+
+    log('AUTH', '✅ Token refreshed successfully!');
+    log('AUTH', `   New token: ${currentIdToken.substring(0, 20)}...`);
+
     return currentIdToken;
   } catch (error) {
-    log('AUTH', `❌ Token refresh failed: ${error.message}`);
+    log('AUTH', `❌ Token refresh failed: ${error.response?.data?.error?.message || error.message}`);
     throw error;
   }
 }
 
 /**
- * Fetch signals from Firestore REST API
- * @param {string} collectionName - Collection to fetch
- * @returns {Promise<Array>} Array of documents
+ * Fetch signals from Firestore REST API with auto-retry on 401
  */
-async function fetchCollection(collectionName) {
+async function fetchCollection(collectionName, retryCount = 0) {
   if (!currentIdToken) {
     throw new Error('No ID token available');
   }
@@ -115,17 +129,30 @@ async function fetchCollection(collectionName) {
 
     return response.data.documents || [];
   } catch (error) {
-    if (error.response?.status === 401 || error.response?.status === 403) {
-      log('AUTH', '⚠️ Token expired or invalid');
+    // If 401/403 and we have a refresh token, try to refresh
+    if ((error.response?.status === 401 || error.response?.status === 403) && currentRefreshToken && retryCount < 1) {
+      log('AUTH', '⚠️ Token expired, attempting refresh...');
+
+      try {
+        await refreshIdToken();
+        // Retry the request with new token
+        return fetchCollection(collectionName, retryCount + 1);
+      } catch (refreshError) {
+        log('AUTH', '❌ Could not refresh token');
+        throw refreshError;
+      }
     }
+
+    if (error.response?.status === 401 || error.response?.status === 403) {
+      log('AUTH', '⚠️ Token invalid - please provide a fresh token');
+    }
+
     throw error;
   }
 }
 
 /**
  * Parse Firestore document fields to normal values
- * @param {Object} fields - Firestore field format
- * @returns {Object} Parsed data
  */
 function parseFirestoreFields(fields) {
   const result = {};
@@ -146,9 +173,70 @@ function parseFirestoreFields(fields) {
 }
 
 /**
+ * Log signal details
+ */
+function logSignalDetails(data) {
+  log('SIGNAL', `   Symbol: ${data.symbol || 'N/A'}`);
+  log('SIGNAL', `   Direction: ${data.direction || data.side || 'N/A'}`);
+  log('SIGNAL', `   Entry: ${data.entryPrice || data.entry || 'N/A'}`);
+  log('SIGNAL', `   Stop Loss: ${data.stopLoss || data.sl || 'N/A'}`);
+
+  const tps = [];
+  for (let i = 1; i <= 5; i++) {
+    const tp = data[`takeProfit${i}`] || data[`tp${i}`];
+    if (tp) tps.push(`TP${i}: ${tp}`);
+  }
+  if (tps.length > 0) {
+    log('SIGNAL', `   Targets: ${tps.join(' | ')}`);
+  }
+
+  log('SIGNAL', `   Free: ${data.isFree ? 'YES' : 'NO'} | Premium: ${data.isPremium ? 'YES' : 'NO'}`);
+}
+
+/**
+ * Format signal data for forwarding
+ */
+function formatSignal(data, docId, collectionName, type) {
+  return {
+    id: docId,
+    source: 'foxsignals',
+    collection: collectionName,
+    type: type,
+    timestamp: new Date().toISOString(),
+
+    symbol: data.symbol || null,
+    direction: data.direction || data.side || null,
+    action: (data.direction || data.side || '').toUpperCase(),
+
+    entry: data.entryPrice || data.entry || null,
+    entryPrice: data.entryPrice || data.entry || null,
+    stopLoss: data.stopLoss || data.sl || null,
+    sl: data.stopLoss || data.sl || null,
+
+    takeProfit: [
+      data.takeProfit1 || data.tp1,
+      data.takeProfit2 || data.tp2,
+      data.takeProfit3 || data.tp3,
+      data.takeProfit4 || data.tp4,
+      data.takeProfit5 || data.tp5
+    ].filter(tp => tp !== undefined && tp !== null),
+    tp1: data.takeProfit1 || data.tp1 || null,
+    tp2: data.takeProfit2 || data.tp2 || null,
+    tp3: data.takeProfit3 || data.tp3 || null,
+    tp4: data.takeProfit4 || data.tp4 || null,
+    tp5: data.takeProfit5 || data.tp5 || null,
+
+    isFree: data.isFree || false,
+    isPremium: data.isPremium || false,
+    status: data.status || null,
+    leverage: data.leverage || null,
+
+    raw: data
+  };
+}
+
+/**
  * Start polling for signals using REST API
- * @param {Function} onSignal - Callback for new signals
- * @param {number} intervalMs - Polling interval in ms (default: 10000)
  */
 function startPolling(onSignal, intervalMs = 10000) {
   log('POLLING', '='.repeat(50));
@@ -211,12 +299,7 @@ function stopPolling() {
   }
 }
 
-/**
- * Listen to a Firestore collection for new signals (Realtime - requires SDK auth)
- * @param {string} collectionName - Collection to listen to
- * @param {Function} onSignal - Callback for new signals
- * @returns {Function} Unsubscribe function
- */
+// Realtime listeners
 let unsubscribes = [];
 
 function listenToCollection(collectionName, onSignal) {
@@ -268,79 +351,6 @@ function listenToCollection(collectionName, onSignal) {
   return unsubscribe;
 }
 
-/**
- * Log signal details in a readable format
- * @param {Object} data - Signal data
- */
-function logSignalDetails(data) {
-  log('SIGNAL', `   Symbol: ${data.symbol || 'N/A'}`);
-  log('SIGNAL', `   Direction: ${data.direction || data.side || 'N/A'}`);
-  log('SIGNAL', `   Entry: ${data.entryPrice || data.entry || 'N/A'}`);
-  log('SIGNAL', `   Stop Loss: ${data.stopLoss || data.sl || 'N/A'}`);
-
-  const tps = [];
-  for (let i = 1; i <= 5; i++) {
-    const tp = data[`takeProfit${i}`] || data[`tp${i}`];
-    if (tp) tps.push(`TP${i}: ${tp}`);
-  }
-  if (tps.length > 0) {
-    log('SIGNAL', `   Targets: ${tps.join(' | ')}`);
-  }
-
-  log('SIGNAL', `   Free: ${data.isFree ? 'YES' : 'NO'} | Premium: ${data.isPremium ? 'YES' : 'NO'}`);
-}
-
-/**
- * Format signal data for forwarding
- * @param {Object} data - Raw signal data
- * @param {string} docId - Document ID
- * @param {string} collectionName - Collection name
- * @param {string} type - Signal type (new/update/closed)
- * @returns {Object} Formatted signal
- */
-function formatSignal(data, docId, collectionName, type) {
-  return {
-    id: docId,
-    source: 'foxsignals',
-    collection: collectionName,
-    type: type,
-    timestamp: new Date().toISOString(),
-
-    symbol: data.symbol || null,
-    direction: data.direction || data.side || null,
-    action: (data.direction || data.side || '').toUpperCase(),
-
-    entry: data.entryPrice || data.entry || null,
-    entryPrice: data.entryPrice || data.entry || null,
-    stopLoss: data.stopLoss || data.sl || null,
-    sl: data.stopLoss || data.sl || null,
-
-    takeProfit: [
-      data.takeProfit1 || data.tp1,
-      data.takeProfit2 || data.tp2,
-      data.takeProfit3 || data.tp3,
-      data.takeProfit4 || data.tp4,
-      data.takeProfit5 || data.tp5
-    ].filter(tp => tp !== undefined && tp !== null),
-    tp1: data.takeProfit1 || data.tp1 || null,
-    tp2: data.takeProfit2 || data.tp2 || null,
-    tp3: data.takeProfit3 || data.tp3 || null,
-    tp4: data.takeProfit4 || data.tp4 || null,
-    tp5: data.takeProfit5 || data.tp5 || null,
-
-    isFree: data.isFree || false,
-    isPremium: data.isPremium || false,
-    status: data.status || null,
-    leverage: data.leverage || null,
-
-    raw: data
-  };
-}
-
-/**
- * Start listening to all signal collections (Realtime)
- * @param {Function} onSignal - Callback for new signals
- */
 function startAllListeners(onSignal) {
   log('FIRESTORE', '='.repeat(50));
   log('FIRESTORE', 'Starting FoxSignals Realtime Listeners');
@@ -360,9 +370,6 @@ function startAllListeners(onSignal) {
   log('FIRESTORE', `✅ Listening to ${collections.length} collections`);
 }
 
-/**
- * Stop all realtime listeners
- */
 function stopAllListeners() {
   log('FIRESTORE', 'Stopping all listeners...');
   unsubscribes.forEach(unsub => unsub());
@@ -370,9 +377,6 @@ function stopAllListeners() {
   log('FIRESTORE', '✅ All listeners stopped');
 }
 
-/**
- * Monitor auth state changes
- */
 function monitorAuthState() {
   onAuthStateChanged(auth, (user) => {
     if (user) {
@@ -383,36 +387,34 @@ function monitorAuthState() {
   });
 }
 
-/**
- * Check if we have valid authentication
- */
 function isAuthenticated() {
   return currentIdToken !== null || auth.currentUser !== null;
 }
 
+function hasRefreshToken() {
+  return currentRefreshToken !== null;
+}
+
 module.exports = {
-  // Auth
   loginWithEmail,
   useIdToken,
+  setRefreshToken,
   refreshIdToken,
   isAuthenticated,
+  hasRefreshToken,
   monitorAuthState,
 
-  // Realtime listeners
   listenToCollection,
   startAllListeners,
   stopAllListeners,
 
-  // REST API polling
   startPolling,
   stopPolling,
   fetchCollection,
 
-  // Utils
   formatSignal,
   parseFirestoreFields,
 
-  // Firebase instances
   auth,
   db
 };

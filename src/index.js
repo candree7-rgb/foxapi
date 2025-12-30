@@ -3,11 +3,11 @@ const express = require('express');
 const {
   loginWithEmail,
   useIdToken,
+  setRefreshToken,
   refreshIdToken,
   startPolling,
   startAllListeners,
-  monitorAuthState,
-  isAuthenticated
+  monitorAuthState
 } = require('./services/firebase');
 const { forwardSignal, testWebhook } = require('./services/forwarder');
 const { log, logSignalBox, logStartupBanner } = require('./utils/logger');
@@ -33,7 +33,6 @@ let stats = {
 
 /**
  * Handle incoming signal from Firebase
- * @param {Object} signal - Parsed signal from Firestore
  */
 async function handleSignal(signal) {
   stats.signalsReceived++;
@@ -138,29 +137,47 @@ async function main() {
   }
 
   try {
-    // Option 1: JWT/ID Token (for Google OAuth users)
-    if (idToken) {
-      log('AUTH', '🔑 Using JWT/ID Token authentication');
-      useIdToken(idToken);
-      stats.authMode = 'jwt_token';
+    // Option 1: Use Refresh Token to get fresh ID Token (BEST for Google OAuth)
+    if (refreshToken) {
+      log('AUTH', '🔄 Refresh token provided - getting fresh ID token...');
+      stats.authMode = 'refresh_token';
 
-      // If refresh token is available, set up auto-refresh
-      if (refreshToken) {
-        log('AUTH', '🔄 Refresh token available - will auto-refresh');
-        // Refresh every 55 minutes (tokens expire after 1 hour)
-        setInterval(async () => {
-          try {
-            await refreshIdToken(refreshToken);
-          } catch (error) {
-            log('AUTH', `❌ Auto-refresh failed: ${error.message}`);
-          }
-        }, 55 * 60 * 1000);
+      // Store the refresh token
+      setRefreshToken(refreshToken);
+
+      // Get a fresh ID token immediately
+      try {
+        await refreshIdToken();
+        log('AUTH', '✅ Got fresh ID token via refresh token!');
+      } catch (error) {
+        log('AUTH', `❌ Failed to refresh token: ${error.message}`);
+        log('AUTH', '   Make sure your refresh token is valid');
+        process.exit(1);
       }
 
-      // Start polling (REST API mode)
+      // Set up auto-refresh every 55 minutes
+      setInterval(async () => {
+        try {
+          await refreshIdToken();
+        } catch (error) {
+          log('AUTH', `❌ Auto-refresh failed: ${error.message}`);
+        }
+      }, 55 * 60 * 1000);
+
+      // Start polling
       startPolling(handleSignal, POLL_INTERVAL);
     }
-    // Option 2: Email/Password login
+    // Option 2: Use provided ID Token directly (may be expired!)
+    else if (idToken) {
+      log('AUTH', '🔑 Using provided ID Token (no refresh token)');
+      log('AUTH', '⚠️ WARNING: Token may expire after 1 hour!');
+      useIdToken(idToken);
+      stats.authMode = 'id_token_only';
+
+      // Start polling
+      startPolling(handleSignal, POLL_INTERVAL);
+    }
+    // Option 3: Email/Password login
     else if (email && password) {
       log('AUTH', '📧 Using Email/Password authentication');
       await loginWithEmail(email, password);
@@ -177,8 +194,10 @@ async function main() {
       log('ERROR', '❌ No authentication provided!');
       log('ERROR', '');
       log('ERROR', 'Set one of these in Railway:');
-      log('ERROR', '  Option 1 (Google Login): FOXSIGNALS_ID_TOKEN');
-      log('ERROR', '  Option 2 (Email Login):  FOXSIGNALS_EMAIL + FOXSIGNALS_PASSWORD');
+      log('ERROR', '');
+      log('ERROR', '  BEST: FOXSIGNALS_REFRESH_TOKEN (auto-refreshes)');
+      log('ERROR', '    OR: FOXSIGNALS_ID_TOKEN (expires after 1h)');
+      log('ERROR', '    OR: FOXSIGNALS_EMAIL + FOXSIGNALS_PASSWORD');
       log('ERROR', '');
       process.exit(1);
     }
@@ -188,8 +207,8 @@ async function main() {
       log('SERVER', `✅ HTTP server running on port ${PORT}`);
       log('SERVER', '='.repeat(50));
       log('SERVER', '🦊 FoxSignals Listener is now active!');
-      log('SERVER', `   Mode: ${stats.authMode === 'jwt_token' ? 'Polling (REST API)' : 'Realtime (WebSocket)'}`);
-      if (stats.authMode === 'jwt_token') {
+      log('SERVER', `   Mode: ${stats.authMode === 'email_password' ? 'Realtime (WebSocket)' : 'Polling (REST API)'}`);
+      if (stats.authMode !== 'email_password') {
         log('SERVER', `   Interval: ${POLL_INTERVAL / 1000} seconds`);
       }
       log('SERVER', '   Waiting for signals...');
