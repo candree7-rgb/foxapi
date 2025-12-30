@@ -1,13 +1,13 @@
 # FoxSignals Realtime Listener
 
-Hört in Echtzeit auf FoxSignals via Firebase und leitet die Signale an deinen Bot weiter.
+Hört auf FoxSignals via Firebase und leitet Signale (Entry, TPs, SL) an deinen Bot weiter.
 
 ## Features
 
-- **Realtime Listening** - Direkte Firebase/Firestore Verbindung
+- **JWT Token Support** - Für Google Login User
+- **Email/Password Support** - Für Email Login User
 - **Alle Signale** - Entry, TP1-TP5, Stop Loss
 - **Multiple Collections** - signalsAggrOpen, signalsCrypto, signalsForex, signalsStocks
-- **Auto-Forward** - Automatische Weiterleitung an deine Webhook-URL
 - **Railway Ready** - Optimiert für Railway Deployment
 
 ## Railway Deployment
@@ -20,29 +20,54 @@ Hört in Echtzeit auf FoxSignals via Firebase und leitet die Signale an deinen B
 
 ### 2. Environment Variables setzen
 
-In Railway → Variables:
-
+**Für Google Login (JWT Token):**
 ```
-FOXSIGNALS_EMAIL=deine-foxsignals@email.com
+FOXSIGNALS_ID_TOKEN=dein-jwt-token
+FOXSIGNALS_REFRESH_TOKEN=dein-refresh-token
+BOT_WEBHOOK_URL=https://dein-bot.com/webhook
+```
+
+**Für Email Login:**
+```
+FOXSIGNALS_EMAIL=deine@email.com
 FOXSIGNALS_PASSWORD=dein-passwort
 BOT_WEBHOOK_URL=https://dein-bot.com/webhook
 ```
 
 ### 3. Deploy!
 
-Railway baut und startet automatisch.
+## Wie bekomme ich den JWT Token?
+
+### Option A: Browser DevTools
+1. Öffne https://getfoxsignals.com und logge dich ein
+2. Öffne DevTools (F12) → Application → Local Storage
+3. Suche nach Firebase Auth Token (fängt mit `eyJ` an)
+
+### Option B: App Traffic abfangen
+1. Nutze mitmproxy oder Charles Proxy
+2. Fange den Traffic der FoxSignals App ab
+3. Suche nach dem `Authorization: Bearer` Header
+
+### Option C: Firebase Auth direkt
+```javascript
+// In der Browser Console auf getfoxsignals.com:
+firebase.auth().currentUser.getIdToken().then(console.log)
+```
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `FOXSIGNALS_EMAIL` | ✅ | Dein FoxSignals Email |
-| `FOXSIGNALS_PASSWORD` | ✅ | Dein FoxSignals Passwort |
+| `FOXSIGNALS_ID_TOKEN` | ✅* | JWT Token (für Google Login) |
+| `FOXSIGNALS_REFRESH_TOKEN` | ❌ | Refresh Token (für Auto-Refresh) |
+| `FOXSIGNALS_EMAIL` | ✅* | Email (für Email Login) |
+| `FOXSIGNALS_PASSWORD` | ✅* | Passwort (für Email Login) |
 | `BOT_WEBHOOK_URL` | ✅ | Webhook URL deines Bots |
-| `WEBHOOK_SECRET` | ❌ | Secret für Bot-Auth |
-| `PORT` | ❌ | Port (default: 3000) |
+| `POLL_INTERVAL` | ❌ | Polling Interval in ms (default: 10000) |
 
-## Was an deinen Bot gesendet wird
+*) Entweder JWT Token ODER Email/Password
+
+## Signal Output
 
 ```json
 {
@@ -57,9 +82,7 @@ Railway baut und startet automatisch.
   "action": "LONG",
 
   "entry": 50000,
-  "entryPrice": 50000,
   "stopLoss": 49000,
-  "sl": 49000,
 
   "takeProfit": [51000, 52000, 53000, 54000, 55000],
   "tp1": 51000,
@@ -69,38 +92,36 @@ Railway baut und startet automatisch.
   "tp5": 55000,
 
   "isFree": true,
-  "isPremium": false,
-  "leverage": 10
+  "isPremium": false
 }
 ```
 
-## Signal Types
-
-- `new` - Neues Signal
-- `update` - Signal wurde aktualisiert
-- `closed` - Signal wurde geschlossen/entfernt
-
 ## Logs in Railway
-
-Die Logs zeigen alle eingehenden Signale:
 
 ```
 ╔══════════════════════════════════════════════════╗
-║ 🦊 FOXSIGNAL NEW                                  ║
+║ 🦊 FOXSIGNAL NEW                                 ║
 ╠══════════════════════════════════════════════════╣
 ║ Symbol:    BTCUSDT                               ║
-║ Direction: long                                   ║
+║ Direction: long                                  ║
 ║ Entry:     50000                                 ║
 ║ Stop Loss: 49000                                 ║
 ╟──────────────────────────────────────────────────╢
 ║ TP1:       51000                                 ║
 ║ TP2:       52000                                 ║
 ║ TP3:       53000                                 ║
-╟──────────────────────────────────────────────────╢
-║ Free: YES  |  Premium: NO                        ║
-║ Time: 2024-01-15T12:00:00.000Z                   ║
 ╚══════════════════════════════════════════════════╝
+
+[FORWARD   ] ✅ Signal forwarded successfully (200)
 ```
+
+## Token Expiration
+
+Firebase ID Tokens laufen nach **1 Stunde** ab.
+
+**Mit Refresh Token:** Wird automatisch alle 55 Minuten erneuert.
+
+**Ohne Refresh Token:** Du musst den Token manuell erneuern und in Railway neu setzen.
 
 ## API Endpoints
 
@@ -110,34 +131,6 @@ Die Logs zeigen alle eingehenden Signale:
 | `/health` | GET | Health Check + Stats |
 | `/stats` | GET | Detaillierte Statistiken |
 | `/test` | POST | Test-Signal an Bot senden |
-
-## Local Development
-
-```bash
-# Dependencies installieren
-npm install
-
-# .env erstellen
-cp .env.example .env
-
-# .env bearbeiten mit deinen Credentials
-
-# Starten
-npm run dev
-```
-
-## Troubleshooting
-
-### "Login failed"
-- Überprüfe Email/Passwort
-- Stelle sicher, dass du einen aktiven FoxSignals Account hast
-
-### "Signal not forwarded"
-- Überprüfe BOT_WEBHOOK_URL
-- Stelle sicher, dass dein Bot erreichbar ist
-
-### "Permission denied"
-- Dein FoxSignals Account benötigt ggf. ein Premium Abo für alle Signale
 
 ## Lizenz
 

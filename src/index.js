@@ -1,11 +1,22 @@
 require('dotenv').config();
 const express = require('express');
-const { login, startAllListeners, monitorAuthState } = require('./services/firebase');
+const {
+  loginWithEmail,
+  useIdToken,
+  refreshIdToken,
+  startPolling,
+  startAllListeners,
+  monitorAuthState,
+  isAuthenticated
+} = require('./services/firebase');
 const { forwardSignal, testWebhook } = require('./services/forwarder');
 const { log, logSignalBox, logStartupBanner } = require('./utils/logger');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Polling interval (default 10 seconds)
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '10000');
 
 // Middleware
 app.use(express.json());
@@ -16,7 +27,8 @@ let stats = {
   signalsReceived: 0,
   signalsForwarded: 0,
   signalsFailed: 0,
-  lastSignal: null
+  lastSignal: null,
+  authMode: null
 };
 
 /**
@@ -40,12 +52,13 @@ async function handleSignal(signal) {
   }
 }
 
-// Health check endpoint (Railway needs this)
+// Health check endpoint
 app.get('/health', (req, res) => {
   const uptime = Math.floor((Date.now() - stats.startTime.getTime()) / 1000);
   res.json({
     status: 'ok',
     uptime: `${uptime}s`,
+    authMode: stats.authMode,
     signals: {
       received: stats.signalsReceived,
       forwarded: stats.signalsForwarded,
@@ -65,6 +78,7 @@ app.get('/', (req, res) => {
     name: 'FoxSignals Listener',
     version: '2.0.0',
     status: 'running',
+    authMode: stats.authMode,
     endpoints: {
       health: '/health',
       stats: '/stats',
@@ -83,6 +97,7 @@ app.get('/stats', (req, res) => {
   res.json({
     uptime: `${hours}h ${minutes}m ${seconds}s`,
     startTime: stats.startTime.toISOString(),
+    authMode: stats.authMode,
     signals: {
       total: stats.signalsReceived,
       forwarded: stats.signalsForwarded,
@@ -112,35 +127,71 @@ async function main() {
     webhookUrl: process.env.BOT_WEBHOOK_URL
   });
 
-  // Check required environment variables
+  // Check authentication options
+  const idToken = process.env.FOXSIGNALS_ID_TOKEN;
+  const refreshToken = process.env.FOXSIGNALS_REFRESH_TOKEN;
   const email = process.env.FOXSIGNALS_EMAIL;
   const password = process.env.FOXSIGNALS_PASSWORD;
-
-  if (!email || !password) {
-    log('ERROR', '❌ FOXSIGNALS_EMAIL and FOXSIGNALS_PASSWORD are required!');
-    log('ERROR', '   Set these environment variables in Railway');
-    process.exit(1);
-  }
 
   if (!process.env.BOT_WEBHOOK_URL) {
     log('WARN', '⚠️ BOT_WEBHOOK_URL not set - signals will be logged but not forwarded');
   }
 
   try {
-    // Login to Firebase with FoxSignals credentials
-    await login(email, password);
+    // Option 1: JWT/ID Token (for Google OAuth users)
+    if (idToken) {
+      log('AUTH', '🔑 Using JWT/ID Token authentication');
+      useIdToken(idToken);
+      stats.authMode = 'jwt_token';
 
-    // Monitor auth state
-    monitorAuthState();
+      // If refresh token is available, set up auto-refresh
+      if (refreshToken) {
+        log('AUTH', '🔄 Refresh token available - will auto-refresh');
+        // Refresh every 55 minutes (tokens expire after 1 hour)
+        setInterval(async () => {
+          try {
+            await refreshIdToken(refreshToken);
+          } catch (error) {
+            log('AUTH', `❌ Auto-refresh failed: ${error.message}`);
+          }
+        }, 55 * 60 * 1000);
+      }
 
-    // Start listening to all signal collections
-    startAllListeners(handleSignal);
+      // Start polling (REST API mode)
+      startPolling(handleSignal, POLL_INTERVAL);
+    }
+    // Option 2: Email/Password login
+    else if (email && password) {
+      log('AUTH', '📧 Using Email/Password authentication');
+      await loginWithEmail(email, password);
+      stats.authMode = 'email_password';
+
+      // Monitor auth state
+      monitorAuthState();
+
+      // Start realtime listeners
+      startAllListeners(handleSignal);
+    }
+    // No auth provided
+    else {
+      log('ERROR', '❌ No authentication provided!');
+      log('ERROR', '');
+      log('ERROR', 'Set one of these in Railway:');
+      log('ERROR', '  Option 1 (Google Login): FOXSIGNALS_ID_TOKEN');
+      log('ERROR', '  Option 2 (Email Login):  FOXSIGNALS_EMAIL + FOXSIGNALS_PASSWORD');
+      log('ERROR', '');
+      process.exit(1);
+    }
 
     // Start HTTP server
     app.listen(PORT, () => {
       log('SERVER', `✅ HTTP server running on port ${PORT}`);
       log('SERVER', '='.repeat(50));
       log('SERVER', '🦊 FoxSignals Listener is now active!');
+      log('SERVER', `   Mode: ${stats.authMode === 'jwt_token' ? 'Polling (REST API)' : 'Realtime (WebSocket)'}`);
+      if (stats.authMode === 'jwt_token') {
+        log('SERVER', `   Interval: ${POLL_INTERVAL / 1000} seconds`);
+      }
       log('SERVER', '   Waiting for signals...');
       log('SERVER', '='.repeat(50));
     });
